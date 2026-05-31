@@ -2,7 +2,7 @@ from threading import Thread, Lock
 from bs4 import BeautifulSoup
 from queue import Queue
 import requests
-
+import multiprocessing
 url_frontier = Queue()
 visited_urls = set()
 visited_lock = Lock()
