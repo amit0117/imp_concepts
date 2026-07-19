@@ -703,6 +703,272 @@ func main() {
 
 ---
 
+# PART 3 — Producer/Consumer Walkthrough, `defer`, `panic`/`recover`, Named Returns
+
+## Q: Walkthrough of a producer/consumer example using an unbuffered channel + a "done" signal channel
+
+```go
+func main() {
+    isProducerDone := make(chan bool)
+    buffer := make(chan int)
+
+    go func() { // producer
+        for i := 0; i < 5; i++ {
+            fmt.Println("Producing..", i)
+            buffer <- i
+            time.Sleep(5 * time.Second)
+        }
+        isProducerDone <- true
+    }()
+
+    go func() { // consumer
+        for product := range buffer {
+            fmt.Println("Consuming..", product)
+        }
+    }()
+
+    <-isProducerDone
+}
+```
+
+`<-isProducerDone` with no variable on the left = **receive and discard**. Its only job
+is to block `main` until the producer sends a value, since without it `main` would return
+instantly and kill both background goroutines before they did any work.
+
+Because `buffer` is **unbuffered**, producer and consumer move in lockstep (a real-time
+handshake): the producer freezes at `buffer <- i` until the consumer is ready to receive,
+so output always appears as `Producing.. N` immediately followed by `Consuming.. N`, one
+pair every 5 seconds, never out of order and never batched.
+
+**Bug in this version — goroutine leak:** `buffer` is never `close()`d, so the consumer's
+`for product := range buffer` waits forever for a 6th item that never comes. When `main`
+exits after receiving `isProducerDone`, the whole process is torn down and that hung
+consumer goroutine is forcibly killed mid-wait. Harmless in a short script, real in a
+long-lived server (leaked goroutines slowly eat memory).
+
+**Idiomatic fix** — close the data channel itself instead of using a second signal
+channel; `range` exits cleanly on its own once the channel is closed and drained:
+```go
+buffer := make(chan int)
+go func() {
+    for i := 0; i < 5; i++ {
+        buffer <- i
+        time.Sleep(time.Second)
+    }
+    close(buffer) // tells range: no more data coming
+}()
+for product := range buffer { fmt.Println("Consuming..", product) } // exits when closed+drained
+```
+
+## Q: "Is buffered acting like a (counting) semaphore and unbuffered like a mutex/binary-semaphore, the way Python has these?"
+
+Yes, conceptually — with one big difference: **Go channels carry data as part of the
+synchronization act; Python's locks/semaphores only carry a signal, never data.**
+
+| Python primitive | Go channel equivalent | Go `sync` equivalent |
+|---|---|---|
+| Mutex / binary semaphore | Unbuffered channel (`make(chan T)`) — forces a real-time rendezvous | `sync.Mutex` |
+| Counting semaphore (N permits) | Buffered channel (`make(chan T, N)`) — N sends proceed without blocking, N+1th blocks until a slot frees | none built-in — channels are the idiom |
+| `Event` (`.set()`/`.wait()`) | **Closing** an empty/`struct{}` channel — every goroutine blocked on `<-ch` unblocks simultaneously, and reads from a closed channel never block again afterward | none needed |
+| `Condition` (`.wait()`/`.notify_all()`) | Usually redesigned as "wait to receive a specific value/close on a channel" | `sync.Cond` (rare in idiomatic Go) |
+
+```go
+// Event equivalent — close() wakes every blocked goroutine at once
+ready := make(chan struct{})
+for i := 1; i <= 3; i++ {
+    go func(id int) { <-ready; fmt.Println("worker", id, "started") }(i)
+}
+close(ready) // == python's event.set()
+```
+
+```go
+// Condition variable equivalent, using literal sync.Cond (traditional style)
+var mu sync.Mutex
+cond := sync.NewCond(&mu)
+job := ""
+go func() {
+    mu.Lock()
+    for job == "" { cond.Wait() } // suspends goroutine, unlocks mu while waiting
+    fmt.Println("processing", job)
+    mu.Unlock()
+}()
+mu.Lock(); job = "Data Analysis"; cond.Signal(); mu.Unlock() // == python's notify()
+```
+
+**Go's own framing:** "share memory by communicating" means most Python-style
+lock/semaphore/event/condition problems get redesigned around passing data through a
+channel rather than protecting a shared variable — `sync.Cond` exists for parity but is
+rarely idiomatic.
+
+## Q: "`buffer := make(chan int)` — that's a single int, so how can `range` loop over it? An integer isn't a sequence."
+
+The loop isn't ranging over an integer value — it's ranging over the **channel itself**,
+which Go treats as a live stream/pipe, not a container:
+
+```go
+for product := range buffer { fmt.Println(product) }
+```
+
+- Each iteration, Go pulls **one** value out of the pipe as it arrives and binds it to
+  `product` — closest Python analogy is iterating a generator (`yield`) or consuming an
+  `asyncio.Queue`, not indexing into a fixed sequence.
+- If the channel is empty, the loop doesn't exit — it blocks in place until either a new
+  value arrives or the channel is closed.
+- The loop terminates **only** when the channel is `close()`d and fully drained. An open
+  channel with no more sends pending will hang the loop forever (see the leak above).
+
+**Buffered-channel contrast — my question: does `buffer` end up literally holding
+`[0,1,2,3,4]` like an array?** No — with the unbuffered version, only one value ever
+exists in the channel at a time; the "array-like" appearance is an illusion created by
+watching 5 sequential handoffs stretched over time, not real simultaneous storage.
+Switch to `make(chan int, 5)` and it becomes literally true: the producer can dump all 5
+ints into the buffer's internal slots instantly (blocking only once the buffer is full),
+and the consumer drains them at its own pace afterward — that's the real difference
+buffering makes.
+
+## Q: What is `defer`, and why/where is it used?
+
+`defer` schedules a function call to run **right before the enclosing function returns**
+— guaranteed, whether it exits via a normal `return` or via a `panic`. It's Go's
+replacement for `finally`, written next to the resource-acquisition line instead of
+bundled at the bottom of the function.
+
+```go
+func readFile(name string) error {
+    f, err := os.Open(name)
+    if err != nil { return err }
+    defer f.Close()          // runs no matter which return statement below fires
+    // ... arbitrarily complex logic, multiple early returns ...
+    return nil
+}
+```
+
+Common uses: closing files/connections, `mu.Unlock()` right after `mu.Lock()`, and
+`recover()` (only usable inside a `defer`).
+
+Rules:
+- **LIFO order** — multiple `defer`s in one function run last-registered-first, like a
+  stack.
+- **Arguments are evaluated immediately at the `defer` line**, not when it actually runs
+  later: `i := 0; defer fmt.Println(i); i++` still prints `0`.
+
+### My observation: "`defer` syntax requires a function call, not a bare variable — that's why we see `defer func(){...}()` with trailing parens"
+
+Exactly backwards from how I'd framed it, but the conclusion is right: `defer` can
+**only** take a function call, never a bare statement or variable. `func() { ... }` is an
+anonymous function literal; the trailing `()` **calls** it immediately, and it's that
+*call* — matching Go's requirement — that gets deferred, not the literal itself.
+
+## Q: How does Go do `try`/`except`/`finally` (or JS `try`/`catch`/`finally`)?
+
+Go has **no exception mechanism for ordinary errors** — errors are just ordinary return
+values checked with `if err != nil` (see Part 1). `panic`/`recover` exist only for a
+narrower category: unexpected runtime crashes (nil dereference, index out of range,
+explicit `panic(...)`), and map onto `try/catch/finally` only in that narrow case:
+
+| Concept | Python/JS | Go |
+|---|---|---|
+| Expected/operational error | `raise`/`throw` + `except`/`catch` | `return err`, checked via `if err != nil` |
+| Unexpected crash | same `try/except` block | `panic` + `recover` |
+| Cleanup regardless of outcome | `finally` | `defer` |
+
+```go
+func riskyOperation() {
+    defer func() {                      // acts as "finally" — always runs
+        if r := recover(); r != nil {   // acts as "catch" — only fires during a panic
+            fmt.Println("recovered:", r)
+        }
+        fmt.Println("cleanup done")
+    }()
+    panic("connection lost")            // acts as "raise"/"throw"
+}
+```
+`panic(v any)` takes exactly one value of any type and returns nothing — it just halts
+normal execution and starts unwinding the stack, running deferred calls along the way.
+`recover()` takes no arguments and returns exactly the value passed to `panic` (or `nil`
+if nothing is panicking) — it **only** does anything meaningful when called directly
+inside a deferred function during an active panic; called anywhere else it's a no-op
+returning `nil`. Once `recover()` returns non-nil, the panic is neutralized and the
+program resumes normally after the function that recovered returns.
+
+## Q: Syntax breakdown of `if r := recover(); r != nil { ... }`
+
+This is Go's **if-with-init-statement** form — semicolon-separated setup + condition, and
+`r` is scoped only to the `if`/`else` block:
+```
+if  r := recover()  ;  r != nil  {
+    ^^^^^^^^^^^^^^^     ^^^^^^^^
+    1. init/assign      2. the actual boolean condition, evaluated after the init runs
+```
+
+## Q: Trace through nested panics/defers/recover across multiple function calls — why does "Returned normally from f." print *after* "Recovered in f 4", not before?
+
+```go
+func main() {
+    f()
+    fmt.Println("Returned normally from f.")
+}
+func f() {
+    defer func() {
+        if r := recover(); r != nil { fmt.Println("Recovered in f", r) }
+    }()
+    fmt.Println("Calling g.")
+    g(0)
+    fmt.Println("Returned normally from g.") // never runs — g panics before returning
+}
+func g(i int) {
+    if i > 3 { panic(fmt.Sprintf("%v", i)) }
+    defer fmt.Println("Defer in g", i)
+    fmt.Println("Printing in g", i)
+    g(i + 1)
+}
+```
+Output:
+```
+Calling g.
+Printing in g 0/1/2/3
+Panicking!
+Defer in g 3/2/1/0     <- stack unwinds through all 4 recursive g() frames
+Recovered in f 4       <- panic reaches f's defer, gets recovered here
+Returned normally from f.
+```
+My confusion was thinking `"Returned normally from f."` belongs to `f`'s own execution —
+it doesn't. That `fmt.Println` call is physically **inside `main`**, on the line right
+after `f()`. It is structurally impossible for it to print before `f()` has completely
+finished (deferred cleanup included) and control has returned to `main`. `f`'s own line
+`"Returned normally from g."` is the one skipped, since the panic in `g` interrupts `f`
+before that line is ever reached — `f` only survives because its `defer` catches the
+panic on the way out.
+
+## Q: What are named return values, and are they unique to Go?
+
+Naming a return parameter in the function signature — `func square(n int) (result int)`
+— pre-declares `result` as a local variable (zero-valued at function start), lets you use
+a bare `return` (returns whatever's currently in the named variable), and — uniquely —
+lets a **deferred function read and mutate it** after the `return` statement's own
+assignment has already happened.
+
+```go
+func c() (i int) {
+    defer func() { i++ }()
+    return 1
+}
+// returns 2, not 1
+```
+Execution order for `return 1`: (1) assign `i = 1`, (2) run deferred calls — `i++` makes
+it `2`, (3) actually hand `i`'s current value back to the caller. The `defer` runs
+*between* the assignment and the actual exit, which is exactly why it can still change the
+outcome.
+
+**Not unique to Go, but rare in mainstream languages today:**
+- **Pascal/Delphi** — originated the idea: assign to the function's own name to set the
+  return value.
+- **C++** — no native syntax, but simulated via reference/pointer "out parameters."
+- **Python, JavaScript, Java** — no equivalent; you must always state the value at the
+  `return` line explicitly (or return a dict/object to fake "named" results).
+
+---
+
 ## Quick-recall index of everything I asked (for fast revision)
 
 **Basics/Syntax**
@@ -755,3 +1021,31 @@ func main() {
 - Full walkthrough of the Profile/Orders concurrent-fetch code
 - "Why do we call this thread communication, I don't see it" → ownership transfer
   explanation + Python `queue.Queue` analogy + ping-pong worker example
+
+**Producer/Consumer, `defer`, `panic`/`recover`, Named Returns**
+- Full walkthrough of a producer/consumer example with `<-isProducerDone` (receive and
+  discard) — why unbuffered channels force lockstep printing, and the goroutine-leak bug
+  from never calling `close(buffer)`
+- Is buffered channel ≈ counting semaphore and unbuffered ≈ mutex/binary-semaphore, like
+  Python? (Yes, conceptually) — and what's the Go equivalent of Python's `Event`
+  (closing a channel) and `Condition` (`sync.Cond`, rarely idiomatic)
+- `buffer := make(chan int)` holds one int — how can `range` loop over it if an int
+  isn't a sequence? (ranging over the channel/pipe, not the value; illusion of an array
+  is really sequential handoffs over time — becomes literally true with a buffered
+  channel)
+- What is `defer`, why/where used (cleanup next to acquisition, LIFO order, args
+  evaluated at defer-time not run-time)
+- Why `defer func(){...}()` has trailing parens — `defer` requires an actual function
+  call, not a bare variable/literal
+- How does Go do `try`/`except`/`finally`? (ordinary errors → return values +
+  `if err != nil`; crashes only → `panic`/`recover`; cleanup → `defer`)
+- What do `panic`/`recover` take and return (`panic(v any)` takes one value, returns
+  nothing; `recover()` takes nothing, returns the panic value or `nil`, only meaningful
+  inside a `defer`)
+- Syntax of `if r := recover(); r != nil` (if-with-init-statement form)
+- Nested panic/defer/recover trace across `f()`→`g()`→`g()`... — why "Returned normally
+  from f." prints *after* "Recovered in f 4" (that line lives in `main`, not `f`, so it
+  can't run until `f` — deferred recover included — has fully returned)
+- What are named return values, why does `func c() (i int) { defer func(){i++}(); return 1 }`
+  return 2 (assign → run defers → exit, in that order) — and is this Go-specific?
+  (No — traces back to Pascal/Delphi; no equivalent in Python/JS/Java)
